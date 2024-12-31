@@ -151,13 +151,15 @@
  *-------------------------------------------------------------------------
  */
 
-#include "postgres.h"
-
 #include "nodes/bitmapset.h"
 #include "port/pg_bitutils.h"
 #include "port/simd.h"
 #include "utils/dsa.h"
 #include "utils/memutils.h"
+#ifdef RT_SHMEM
+#include "miscadmin.h"
+#include "storage/lwlock.h"
+#endif
 
 /* helpers */
 #define RT_MAKE_PREFIX(a) CppConcat(a,_)
@@ -541,14 +543,18 @@ typedef struct RT_NODE_48
 {
 	RT_NODE		base;
 
-	/* The index of slots for each fanout */
+	/* bitmap to track which slots are in use */
+	bitmapword	isset[RT_BM_IDX(RT_FANOUT_48_MAX)];
+
+	/*
+	 * Lookup table for indexes into the children[] array. We make this the
+	 * last fixed-size member so that it's convenient to memset separately
+	 * from the previous members.
+	 */
 	uint8		slot_idxs[RT_NODE_MAX_SLOTS];
 
 /* Invalid index */
 #define RT_INVALID_SLOT_IDX	0xFF
-
-	/* bitmap to track which slots are in use */
-	bitmapword	isset[RT_BM_IDX(RT_FANOUT_48_MAX)];
 
 	/* number of children depends on size class */
 	RT_PTR_ALLOC children[FLEXIBLE_ARRAY_MEMBER];
@@ -845,27 +851,25 @@ RT_ALLOC_NODE(RT_RADIX_TREE * tree, const uint8 kind, const RT_SIZE_CLASS size_c
 
 	/* initialize contents */
 
-	memset(node, 0, sizeof(RT_NODE));
 	switch (kind)
 	{
 		case RT_NODE_KIND_4:
+			memset(node, 0, offsetof(RT_NODE_4, children));
+			break;
 		case RT_NODE_KIND_16:
+			memset(node, 0, offsetof(RT_NODE_16, children));
 			break;
 		case RT_NODE_KIND_48:
 			{
 				RT_NODE_48 *n48 = (RT_NODE_48 *) node;
 
-				memset(n48->isset, 0, sizeof(n48->isset));
+				memset(n48, 0, offsetof(RT_NODE_48, slot_idxs));
 				memset(n48->slot_idxs, RT_INVALID_SLOT_IDX, sizeof(n48->slot_idxs));
 				break;
 			}
 		case RT_NODE_KIND_256:
-			{
-				RT_NODE_256 *n256 = (RT_NODE_256 *) node;
-
-				memset(n256->isset, 0, sizeof(n256->isset));
-				break;
-			}
+			memset(node, 0, offsetof(RT_NODE_256, children));
+			break;
 		default:
 			pg_unreachable();
 	}

@@ -426,7 +426,11 @@ struct PlannerInfo
 	 * items to be proven redundant, implying that there is only one group
 	 * containing all the query's rows.  Hence, if you want to check whether
 	 * GROUP BY was specified, test for nonempty parse->groupClause, not for
-	 * nonempty processed_groupClause.
+	 * nonempty processed_groupClause.  Optimizer chooses specific order of
+	 * group-by clauses during the upper paths generation process, attempting
+	 * to use different strategies to minimize number of sorts or engage
+	 * incremental sort.  See preprocess_groupclause() and
+	 * get_useful_group_keys_orderings() for details.
 	 *
 	 * Currently, when grouping sets are specified we do not attempt to
 	 * optimize the groupClause, so that processed_groupClause will be
@@ -504,6 +508,12 @@ struct PlannerInfo
 	bool		placeholdersFrozen;
 	/* true if planning a recursive WITH item */
 	bool		hasRecursion;
+
+	/*
+	 * The rangetable index for the RTE_GROUP RTE, or 0 if there is no
+	 * RTE_GROUP RTE.
+	 */
+	int			group_rtindex;
 
 	/*
 	 * Information about aggregates. Filled by preprocess_aggrefs().
@@ -1097,6 +1107,9 @@ typedef struct IndexOptInfo IndexOptInfo;
 #define HAVE_INDEXOPTINFO_TYPEDEF 1
 #endif
 
+struct IndexPath;				/* avoid including pathnodes.h here */
+struct PlannerInfo;				/* avoid including pathnodes.h here */
+
 struct IndexOptInfo
 {
 	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
@@ -1174,6 +1187,8 @@ struct IndexOptInfo
 	bool		predOK;
 	/* true if a unique index */
 	bool		unique;
+	/* true if the index was defined with NULLS NOT DISTINCT */
+	bool		nullsnotdistinct;
 	/* is uniqueness enforced immediately? */
 	bool		immediate;
 	/* true if index doesn't really exist */
@@ -1196,7 +1211,7 @@ struct IndexOptInfo
 	bool		amcanmarkpos;
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
-	void		(*amcostestimate) () pg_node_attr(read_write_ignore);
+	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
 };
 
 /*
@@ -1468,14 +1483,21 @@ typedef struct PathKey
 } PathKey;
 
 /*
- * Combines the information about pathkeys and the associated clauses.
+ * Contains an order of group-by clauses and the corresponding list of
+ * pathkeys.
+ *
+ * The elements of 'clauses' list should have the same order as the head of
+ * 'pathkeys' list.  The tleSortGroupRef of the clause should be equal to
+ * ec_sortref of the pathkey equivalence class.  If there are redundant
+ * clauses with the same tleSortGroupRef, they must be grouped together.
  */
-typedef struct PathKeyInfo
+typedef struct GroupByOrdering
 {
 	NodeTag		type;
+
 	List	   *pathkeys;
 	List	   *clauses;
-} PathKeyInfo;
+} GroupByOrdering;
 
 /*
  * VolatileFunctionStatus -- allows nodes to cache their
@@ -1647,6 +1669,7 @@ typedef struct Path
 
 	/* estimated size/costs for path (see costsize.c for more info) */
 	Cardinality rows;			/* estimated number of result tuples */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -2319,13 +2342,12 @@ typedef struct WindowAggPath
 typedef struct SetOpPath
 {
 	Path		path;
-	Path	   *subpath;		/* path representing input source */
+	Path	   *leftpath;		/* paths representing input sources */
+	Path	   *rightpath;
 	SetOpCmd	cmd;			/* what to do, see nodes.h */
 	SetOpStrategy strategy;		/* how to do it, see nodes.h */
-	List	   *distinctList;	/* SortGroupClauses identifying target cols */
-	AttrNumber	flagColIdx;		/* where is the flag column, if any */
-	int			firstFlag;		/* flag value for first input relation */
-	Cardinality numGroups;		/* estimated number of groups in input */
+	List	   *groupList;		/* SortGroupClauses identifying target cols */
+	Cardinality numGroups;		/* estimated number of groups in left input */
 } SetOpPath;
 
 /*
@@ -2812,9 +2834,9 @@ typedef struct PlaceHolderVar
  * min_lefthand and min_righthand for higher joins.)
  *
  * jointype is never JOIN_RIGHT; a RIGHT JOIN is handled by switching
- * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_ANTI either.
- * So the allowed values of jointype in a join_info_list member are only
- * LEFT, FULL, SEMI, or ANTI.
+ * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_SEMI or
+ * JOIN_RIGHT_ANTI either.  So the allowed values of jointype in a
+ * join_info_list member are only LEFT, FULL, SEMI, or ANTI.
  *
  * ojrelid is the RT index of the join RTE representing this outer join,
  * if there is one.  It is zero when jointype is INNER or SEMI, and can be
@@ -3322,6 +3344,7 @@ typedef struct
 typedef struct JoinCostWorkspace
 {
 	/* Preliminary cost estimates --- must not be larger than final ones! */
+	int			disabled_nodes;
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
