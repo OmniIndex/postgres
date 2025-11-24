@@ -8,7 +8,7 @@
  * relations need be included.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_attribute.h
@@ -23,7 +23,7 @@
 #define PG_ATTRIBUTE_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_attribute_d.h"
+#include "catalog/pg_attribute_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_attribute definition.  cpp turns this into
@@ -117,7 +117,9 @@ CATALOG(pg_attribute,1249,AttributeRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(75,
 	 */
 	char		attcompression BKI_DEFAULT('\0');
 
-	/* This flag represents the "NOT NULL" constraint */
+	/*
+	 * Whether a (possibly invalid) not-null constraint exists for the column
+	 */
 	bool		attnotnull;
 
 	/* Has DEFAULT value or not */
@@ -225,6 +227,7 @@ MAKE_SYSCACHE(ATTNUM, pg_attribute_relid_attnum_index, 128);
 #define		  ATTRIBUTE_IDENTITY_BY_DEFAULT 'd'
 
 #define		  ATTRIBUTE_GENERATED_STORED	's'
+#define		  ATTRIBUTE_GENERATED_VIRTUAL	'v'
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

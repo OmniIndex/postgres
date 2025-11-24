@@ -3,7 +3,7 @@
  * connection.c
  *		  Connection management functions for postgres_fdw
  *
- * Portions Copyright (c) 2012-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/connection.c
@@ -16,9 +16,11 @@
 #include <poll.h>
 #endif
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_user_mapping.h"
 #include "commands/defrem.h"
+#include "common/base64.h"
 #include "funcapi.h"
 #include "libpq/libpq-be.h"
 #include "libpq/libpq-be-fe-helpers.h"
@@ -141,6 +143,8 @@ static void do_sql_command_begin(PGconn *conn, const char *sql);
 static void do_sql_command_end(PGconn *conn, const char *sql,
 							   bool consume_input);
 static void begin_remote_xact(ConnCacheEntry *entry);
+static void pgfdw_report_internal(int elevel, PGresult *res, PGconn *conn,
+								  const char *sql);
 static void pgfdw_xact_callback(XactEvent event, void *arg);
 static void pgfdw_subxact_callback(SubXactEvent event,
 								   SubTransactionId mySubid,
@@ -177,11 +181,13 @@ static void pgfdw_finish_abort_cleanup(List *pending_entries,
 static void pgfdw_security_check(const char **keywords, const char **values,
 								 UserMapping *user, PGconn *conn);
 static bool UserMappingPasswordRequired(UserMapping *user);
+static bool UseScramPassthrough(ForeignServer *server, UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
 static void postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
 												  enum pgfdwVersion api_version);
 static int	pgfdw_conn_check(PGconn *conn);
 static bool pgfdw_conn_checkable(void);
+static bool pgfdw_has_required_scram_options(const char **keywords, const char **values);
 
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
@@ -453,6 +459,15 @@ pgfdw_security_check(const char **keywords, const char **values, UserMapping *us
 		}
 	}
 
+	/*
+	 * Ok if SCRAM pass-through is being used and all required SCRAM options
+	 * are set correctly. If pgfdw_has_required_scram_options returns true we
+	 * assume that UseScramPassthrough is also true since SCRAM options are
+	 * only set when UseScramPassthrough is enabled.
+	 */
+	if (MyProcPort != NULL && MyProcPort->has_scram_keys && pgfdw_has_required_scram_options(keywords, values))
+		return;
+
 	ereport(ERROR,
 			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
 			 errmsg("password or GSSAPI delegated credentials required"),
@@ -483,9 +498,10 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		 * and UserMapping.  (Some of them might not be libpq options, in
 		 * which case we'll just waste a few array slots.)  Add 4 extra slots
 		 * for application_name, fallback_application_name, client_encoding,
-		 * end marker.
+		 * end marker, and 3 extra slots for scram keys and required scram
+		 * pass-through options.
 		 */
-		n = list_length(server->options) + list_length(user->options) + 4;
+		n = list_length(server->options) + list_length(user->options) + 4 + 3;
 		keywords = (const char **) palloc(n * sizeof(char *));
 		values = (const char **) palloc(n * sizeof(char *));
 
@@ -554,9 +570,46 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 		values[n] = GetDatabaseEncodingName();
 		n++;
 
+		/* Add required SCRAM pass-through connection options if it's enabled. */
+		if (MyProcPort != NULL && MyProcPort->has_scram_keys && UseScramPassthrough(server, user))
+		{
+			int			len;
+			int			encoded_len;
+
+			keywords[n] = "scram_client_key";
+			len = pg_b64_enc_len(sizeof(MyProcPort->scram_ClientKey));
+			/* don't forget the zero-terminator */
+			values[n] = palloc0(len + 1);
+			encoded_len = pg_b64_encode(MyProcPort->scram_ClientKey,
+										sizeof(MyProcPort->scram_ClientKey),
+										(char *) values[n], len);
+			if (encoded_len < 0)
+				elog(ERROR, "could not encode SCRAM client key");
+			n++;
+
+			keywords[n] = "scram_server_key";
+			len = pg_b64_enc_len(sizeof(MyProcPort->scram_ServerKey));
+			/* don't forget the zero-terminator */
+			values[n] = palloc0(len + 1);
+			encoded_len = pg_b64_encode(MyProcPort->scram_ServerKey,
+										sizeof(MyProcPort->scram_ServerKey),
+										(char *) values[n], len);
+			if (encoded_len < 0)
+				elog(ERROR, "could not encode SCRAM server key");
+			n++;
+
+			/*
+			 * Require scram-sha-256 to ensure that no other auth method is
+			 * used when connecting with foreign server.
+			 */
+			keywords[n] = "require_auth";
+			values[n] = "scram-sha-256";
+			n++;
+		}
+
 		keywords[n] = values[n] = NULL;
 
-		/* verify the set of connection parameters */
+		/* Verify the set of connection parameters. */
 		check_conn_params(keywords, values, user);
 
 		/* first time, allocate or get the custom wait event */
@@ -575,7 +628,10 @@ connect_pg_server(ForeignServer *server, UserMapping *user)
 							server->servername),
 					 errdetail_internal("%s", pchomp(PQerrorMessage(conn)))));
 
-		/* Perform post-connection security checks */
+		PQsetNoticeReceiver(conn, libpqsrv_notice_receiver,
+							"received message via remote connection");
+
+		/* Perform post-connection security checks. */
 		pgfdw_security_check(keywords, values, user, conn);
 
 		/* Prepare new session for use */
@@ -629,6 +685,30 @@ UserMappingPasswordRequired(UserMapping *user)
 	return true;
 }
 
+static bool
+UseScramPassthrough(ForeignServer *server, UserMapping *user)
+{
+	ListCell   *cell;
+
+	foreach(cell, server->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	foreach(cell, user->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(cell);
+
+		if (strcmp(def->defname, "use_scram_passthrough") == 0)
+			return defGetBoolean(def);
+	}
+
+	return false;
+}
+
 /*
  * For non-superusers, insist that the connstr specify a password or that the
  * user provided their own GSSAPI delegated credentials.  This
@@ -663,10 +743,19 @@ check_conn_params(const char **keywords, const char **values, UserMapping *user)
 	if (!UserMappingPasswordRequired(user))
 		return;
 
+	/*
+	 * Ok if SCRAM pass-through is being used and all required scram options
+	 * are set correctly. If pgfdw_has_required_scram_options returns true we
+	 * assume that UseScramPassthrough is also true since SCRAM options are
+	 * only set when UseScramPassthrough is enabled.
+	 */
+	if (MyProcPort != NULL && MyProcPort->has_scram_keys && pgfdw_has_required_scram_options(keywords, values))
+		return;
+
 	ereport(ERROR,
 			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
 			 errmsg("password or GSSAPI delegated credentials required"),
-			 errdetail("Non-superusers must delegate GSSAPI credentials or provide a password in the user mapping.")));
+			 errdetail("Non-superusers must delegate GSSAPI credentials, provide a password, or enable SCRAM pass-through in user mapping.")));
 }
 
 /*
@@ -729,7 +818,7 @@ static void
 do_sql_command_begin(PGconn *conn, const char *sql)
 {
 	if (!PQsendQuery(conn, sql))
-		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+		pgfdw_report_error(NULL, conn, sql);
 }
 
 static void
@@ -744,10 +833,10 @@ do_sql_command_end(PGconn *conn, const char *sql, bool consume_input)
 	 * would be large compared to the overhead of PQconsumeInput.)
 	 */
 	if (consume_input && !PQconsumeInput(conn))
-		pgfdw_report_error(ERROR, NULL, conn, false, sql);
+		pgfdw_report_error(NULL, conn, sql);
 	res = pgfdw_get_result(conn);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, conn, true, sql);
+		pgfdw_report_error(res, conn, sql);
 	PQclear(res);
 }
 
@@ -880,63 +969,73 @@ pgfdw_get_result(PGconn *conn)
 /*
  * Report an error we got from the remote server.
  *
- * elevel: error level to use (typically ERROR, but might be less)
- * res: PGresult containing the error
+ * Callers should use pgfdw_report_error() to throw an error, or use
+ * pgfdw_report() for lesser message levels.  (We make this distinction
+ * so that pgfdw_report_error() can be marked noreturn.)
+ *
+ * res: PGresult containing the error (might be NULL)
  * conn: connection we did the query on
- * clear: if true, PQclear the result (otherwise caller will handle it)
  * sql: NULL, or text of remote command we tried to execute
+ *
+ * If "res" is not NULL, it'll be PQclear'ed here (unless we throw error,
+ * in which case memory context cleanup will clear it eventually).
  *
  * Note: callers that choose not to throw ERROR for a remote error are
  * responsible for making sure that the associated ConnCacheEntry gets
  * marked with have_error = true.
  */
 void
-pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
-				   bool clear, const char *sql)
+pgfdw_report_error(PGresult *res, PGconn *conn, const char *sql)
 {
-	/* If requested, PGresult must be released before leaving this function. */
-	PG_TRY();
-	{
-		char	   *diag_sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
-		char	   *message_primary = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
-		char	   *message_detail = PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL);
-		char	   *message_hint = PQresultErrorField(res, PG_DIAG_MESSAGE_HINT);
-		char	   *message_context = PQresultErrorField(res, PG_DIAG_CONTEXT);
-		int			sqlstate;
+	pgfdw_report_internal(ERROR, res, conn, sql);
+	pg_unreachable();
+}
 
-		if (diag_sqlstate)
-			sqlstate = MAKE_SQLSTATE(diag_sqlstate[0],
-									 diag_sqlstate[1],
-									 diag_sqlstate[2],
-									 diag_sqlstate[3],
-									 diag_sqlstate[4]);
-		else
-			sqlstate = ERRCODE_CONNECTION_FAILURE;
+void
+pgfdw_report(int elevel, PGresult *res, PGconn *conn, const char *sql)
+{
+	Assert(elevel < ERROR);		/* use pgfdw_report_error for that */
+	pgfdw_report_internal(elevel, res, conn, sql);
+}
 
-		/*
-		 * If we don't get a message from the PGresult, try the PGconn.  This
-		 * is needed because for connection-level failures, PQgetResult may
-		 * just return NULL, not a PGresult at all.
-		 */
-		if (message_primary == NULL)
-			message_primary = pchomp(PQerrorMessage(conn));
+static void
+pgfdw_report_internal(int elevel, PGresult *res, PGconn *conn,
+					  const char *sql)
+{
+	char	   *diag_sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+	char	   *message_primary = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
+	char	   *message_detail = PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL);
+	char	   *message_hint = PQresultErrorField(res, PG_DIAG_MESSAGE_HINT);
+	char	   *message_context = PQresultErrorField(res, PG_DIAG_CONTEXT);
+	int			sqlstate;
 
-		ereport(elevel,
-				(errcode(sqlstate),
-				 (message_primary != NULL && message_primary[0] != '\0') ?
-				 errmsg_internal("%s", message_primary) :
-				 errmsg("could not obtain message string for remote error"),
-				 message_detail ? errdetail_internal("%s", message_detail) : 0,
-				 message_hint ? errhint("%s", message_hint) : 0,
-				 message_context ? errcontext("%s", message_context) : 0,
-				 sql ? errcontext("remote SQL command: %s", sql) : 0));
-	}
-	PG_FINALLY();
-	{
-		if (clear)
-			PQclear(res);
-	}
-	PG_END_TRY();
+	if (diag_sqlstate)
+		sqlstate = MAKE_SQLSTATE(diag_sqlstate[0],
+								 diag_sqlstate[1],
+								 diag_sqlstate[2],
+								 diag_sqlstate[3],
+								 diag_sqlstate[4]);
+	else
+		sqlstate = ERRCODE_CONNECTION_FAILURE;
+
+	/*
+	 * If we don't get a message from the PGresult, try the PGconn.  This is
+	 * needed because for connection-level failures, PQgetResult may just
+	 * return NULL, not a PGresult at all.
+	 */
+	if (message_primary == NULL)
+		message_primary = pchomp(PQerrorMessage(conn));
+
+	ereport(elevel,
+			(errcode(sqlstate),
+			 (message_primary != NULL && message_primary[0] != '\0') ?
+			 errmsg_internal("%s", message_primary) :
+			 errmsg("could not obtain message string for remote error"),
+			 message_detail ? errdetail_internal("%s", message_detail) : 0,
+			 message_hint ? errhint("%s", message_hint) : 0,
+			 message_context ? errcontext("%s", message_context) : 0,
+			 sql ? errcontext("remote SQL command: %s", sql) : 0));
+	PQclear(res);
 }
 
 /*
@@ -1459,7 +1558,7 @@ pgfdw_exec_cleanup_query_begin(PGconn *conn, const char *query)
 	 */
 	if (!PQsendQuery(conn, query))
 	{
-		pgfdw_report_error(WARNING, NULL, conn, false, query);
+		pgfdw_report(WARNING, NULL, conn, query);
 		return false;
 	}
 
@@ -1484,7 +1583,7 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 	 */
 	if (consume_input && !PQconsumeInput(conn))
 	{
-		pgfdw_report_error(WARNING, NULL, conn, false, query);
+		pgfdw_report(WARNING, NULL, conn, query);
 		return false;
 	}
 
@@ -1496,7 +1595,7 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 					(errmsg("could not get query result due to timeout"),
 					 errcontext("remote SQL command: %s", query)));
 		else
-			pgfdw_report_error(WARNING, NULL, conn, false, query);
+			pgfdw_report(WARNING, NULL, conn, query);
 
 		return false;
 	}
@@ -1504,7 +1603,7 @@ pgfdw_exec_cleanup_query_end(PGconn *conn, const char *query,
 	/* Issue a warning if not successful. */
 	if (PQresultStatus(result) != PGRES_COMMAND_OK)
 	{
-		pgfdw_report_error(WARNING, result, conn, true, query);
+		pgfdw_report(WARNING, result, conn, query);
 		return ignore_errors;
 	}
 	PQclear(result);
@@ -1532,103 +1631,90 @@ pgfdw_get_cleanup_result(PGconn *conn, TimestampTz endtime,
 						 PGresult **result,
 						 bool *timed_out)
 {
-	volatile bool failed = false;
-	PGresult   *volatile last_res = NULL;
+	bool		failed = false;
+	PGresult   *last_res = NULL;
+	int			canceldelta = RETRY_CANCEL_TIMEOUT * 2;
 
 	*result = NULL;
 	*timed_out = false;
-
-	/* In what follows, do not leak any PGresults on an error. */
-	PG_TRY();
+	for (;;)
 	{
-		int			canceldelta = RETRY_CANCEL_TIMEOUT * 2;
+		PGresult   *res;
 
-		for (;;)
+		while (PQisBusy(conn))
 		{
-			PGresult   *res;
+			int			wc;
+			TimestampTz now = GetCurrentTimestamp();
+			long		cur_timeout;
 
-			while (PQisBusy(conn))
+			/* If timeout has expired, give up. */
+			if (now >= endtime)
 			{
-				int			wc;
-				TimestampTz now = GetCurrentTimestamp();
-				long		cur_timeout;
-
-				/* If timeout has expired, give up. */
-				if (now >= endtime)
-				{
-					*timed_out = true;
-					failed = true;
-					goto exit;
-				}
-
-				/* If we need to re-issue the cancel request, do that. */
-				if (now >= retrycanceltime)
-				{
-					/* We ignore failure to issue the repeated request. */
-					(void) libpqsrv_cancel(conn, endtime);
-
-					/* Recompute "now" in case that took measurable time. */
-					now = GetCurrentTimestamp();
-
-					/* Adjust re-cancel timeout in increasing steps. */
-					retrycanceltime = TimestampTzPlusMilliseconds(now,
-																  canceldelta);
-					canceldelta += canceldelta;
-				}
-
-				/* If timeout has expired, give up, else get sleep time. */
-				cur_timeout = TimestampDifferenceMilliseconds(now,
-															  Min(endtime,
-																  retrycanceltime));
-				if (cur_timeout <= 0)
-				{
-					*timed_out = true;
-					failed = true;
-					goto exit;
-				}
-
-				/* first time, allocate or get the custom wait event */
-				if (pgfdw_we_cleanup_result == 0)
-					pgfdw_we_cleanup_result = WaitEventExtensionNew("PostgresFdwCleanupResult");
-
-				/* Sleep until there's something to do */
-				wc = WaitLatchOrSocket(MyLatch,
-									   WL_LATCH_SET | WL_SOCKET_READABLE |
-									   WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-									   PQsocket(conn),
-									   cur_timeout, pgfdw_we_cleanup_result);
-				ResetLatch(MyLatch);
-
-				CHECK_FOR_INTERRUPTS();
-
-				/* Data available in socket? */
-				if (wc & WL_SOCKET_READABLE)
-				{
-					if (!PQconsumeInput(conn))
-					{
-						/* connection trouble */
-						failed = true;
-						goto exit;
-					}
-				}
+				*timed_out = true;
+				failed = true;
+				goto exit;
 			}
 
-			res = PQgetResult(conn);
-			if (res == NULL)
-				break;			/* query is complete */
+			/* If we need to re-issue the cancel request, do that. */
+			if (now >= retrycanceltime)
+			{
+				/* We ignore failure to issue the repeated request. */
+				(void) libpqsrv_cancel(conn, endtime);
 
-			PQclear(last_res);
-			last_res = res;
+				/* Recompute "now" in case that took measurable time. */
+				now = GetCurrentTimestamp();
+
+				/* Adjust re-cancel timeout in increasing steps. */
+				retrycanceltime = TimestampTzPlusMilliseconds(now,
+															  canceldelta);
+				canceldelta += canceldelta;
+			}
+
+			/* If timeout has expired, give up, else get sleep time. */
+			cur_timeout = TimestampDifferenceMilliseconds(now,
+														  Min(endtime,
+															  retrycanceltime));
+			if (cur_timeout <= 0)
+			{
+				*timed_out = true;
+				failed = true;
+				goto exit;
+			}
+
+			/* first time, allocate or get the custom wait event */
+			if (pgfdw_we_cleanup_result == 0)
+				pgfdw_we_cleanup_result = WaitEventExtensionNew("PostgresFdwCleanupResult");
+
+			/* Sleep until there's something to do */
+			wc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_SOCKET_READABLE |
+								   WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								   PQsocket(conn),
+								   cur_timeout, pgfdw_we_cleanup_result);
+			ResetLatch(MyLatch);
+
+			CHECK_FOR_INTERRUPTS();
+
+			/* Data available in socket? */
+			if (wc & WL_SOCKET_READABLE)
+			{
+				if (!PQconsumeInput(conn))
+				{
+					/* connection trouble */
+					failed = true;
+					goto exit;
+				}
+			}
 		}
-exit:	;
-	}
-	PG_CATCH();
-	{
-		PQclear(last_res);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 
+		res = PQgetResult(conn);
+		if (res == NULL)
+			break;				/* query is complete */
+
+		PQclear(last_res);
+		last_res = res;
+	}
+exit:
 	if (failed)
 		PQclear(last_res);
 	else
@@ -2049,8 +2135,8 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
 
 /* Number of output arguments (columns) for various API versions */
 #define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_1	2
-#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2	5
-#define POSTGRES_FDW_GET_CONNECTIONS_COLS	5	/* maximum of above */
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2	6
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS	6	/* maximum of above */
 
 /*
  * Internal function used by postgres_fdw_get_connections variants.
@@ -2066,13 +2152,15 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
  *
  * For API version 1.2 and later, this function takes an input parameter
  * to check a connection status and returns the following
- * additional values along with the three values from version 1.1:
+ * additional values along with the four values from version 1.1:
  *
  * - user_name - the local user name of the active connection. In case the
  *   user mapping is dropped but the connection is still active, then the
  *   user name will be NULL in the output.
  * - used_in_xact - true if the connection is used in the current transaction.
  * - closed - true if the connection is closed.
+ * - remote_backend_pid - process ID of the remote backend, on the foreign
+ *   server, handling the connection.
  *
  * No records are returned when there are no cached connections at all.
  */
@@ -2211,6 +2299,9 @@ postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
 				values[i++] = BoolGetDatum(pgfdw_conn_check(entry->conn) != 0);
 			else
 				nulls[i++] = true;
+
+			/* Return process ID of remote backend */
+			values[i++] = Int32GetDatum(PQbackendPID(entry->conn));
 		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
@@ -2419,4 +2510,57 @@ pgfdw_conn_checkable(void)
 #else
 	return false;
 #endif
+}
+
+/*
+ * Ensure that require_auth and SCRAM keys are correctly set on values. SCRAM
+ * keys used to pass-through are coming from the initial connection from the
+ * client with the server.
+ *
+ * All required SCRAM options are set by postgres_fdw, so we just need to
+ * ensure that these options are not overwritten by the user.
+ */
+static bool
+pgfdw_has_required_scram_options(const char **keywords, const char **values)
+{
+	bool		has_scram_server_key = false;
+	bool		has_scram_client_key = false;
+	bool		has_require_auth = false;
+	bool		has_scram_keys = false;
+
+	/*
+	 * Continue iterating even if we found the keys that we need to validate
+	 * to make sure that there is no other declaration of these keys that can
+	 * overwrite the first.
+	 */
+	for (int i = 0; keywords[i] != NULL; i++)
+	{
+		if (strcmp(keywords[i], "scram_client_key") == 0)
+		{
+			if (values[i] != NULL && values[i][0] != '\0')
+				has_scram_client_key = true;
+			else
+				has_scram_client_key = false;
+		}
+
+		if (strcmp(keywords[i], "scram_server_key") == 0)
+		{
+			if (values[i] != NULL && values[i][0] != '\0')
+				has_scram_server_key = true;
+			else
+				has_scram_server_key = false;
+		}
+
+		if (strcmp(keywords[i], "require_auth") == 0)
+		{
+			if (values[i] != NULL && strcmp(values[i], "scram-sha-256") == 0)
+				has_require_auth = true;
+			else
+				has_require_auth = false;
+		}
+	}
+
+	has_scram_keys = has_scram_client_key && has_scram_server_key && MyProcPort != NULL && MyProcPort->has_scram_keys;
+
+	return (has_scram_keys && has_require_auth);
 }

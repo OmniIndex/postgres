@@ -33,7 +33,7 @@
  * input group.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -88,7 +88,6 @@ build_hash_table(SetOpState *setopstate)
 	TupleDesc	desc = ExecGetResultType(outerPlanState(setopstate));
 
 	Assert(node->strategy == SETOP_HASHED);
-	Assert(node->numGroups > 0);
 
 	/*
 	 * If both child plans deliver the same fixed tuple slot type, we can tell
@@ -104,11 +103,20 @@ build_hash_table(SetOpState *setopstate)
 												setopstate->hashfunctions,
 												node->cmpCollations,
 												node->numGroups,
-												0,
+												sizeof(SetOpStatePerGroupData),
 												setopstate->ps.state->es_query_cxt,
-												setopstate->tableContext,
+												setopstate->tuplesContext,
 												econtext->ecxt_per_tuple_memory,
 												false);
+}
+
+/* Planner support routine to estimate space needed for hash table */
+Size
+EstimateSetOpHashTableSpace(double nentries, Size tupleWidth)
+{
+	return EstimateTupleHashTableSpace(nentries,
+									   tupleWidth,
+									   sizeof(SetOpStatePerGroupData));
 }
 
 /*
@@ -424,7 +432,9 @@ setop_fill_hash_table(SetOpState *setopstate)
 	for (;;)
 	{
 		TupleTableSlot *outerslot;
+		TupleHashTable hashtable = setopstate->hashtable;
 		TupleHashEntryData *entry;
+		SetOpStatePerGroup pergroup;
 		bool		isnew;
 
 		outerslot = ExecProcNode(outerPlan);
@@ -433,20 +443,20 @@ setop_fill_hash_table(SetOpState *setopstate)
 		have_tuples = true;
 
 		/* Find or build hashtable entry for this tuple's group */
-		entry = LookupTupleHashEntry(setopstate->hashtable,
+		entry = LookupTupleHashEntry(hashtable,
 									 outerslot,
 									 &isnew, NULL);
 
+		pergroup = TupleHashEntryGetAdditional(hashtable, entry);
 		/* If new tuple group, initialize counts to zero */
 		if (isnew)
 		{
-			entry->additional = (SetOpStatePerGroup)
-				MemoryContextAllocZero(setopstate->hashtable->tablecxt,
-									   sizeof(SetOpStatePerGroupData));
+			pergroup->numLeft = 0;
+			pergroup->numRight = 0;
 		}
 
 		/* Advance the counts */
-		((SetOpStatePerGroup) entry->additional)->numLeft++;
+		pergroup->numLeft++;
 
 		/* Must reset expression context after each hashtable lookup */
 		ResetExprContext(econtext);
@@ -465,6 +475,7 @@ setop_fill_hash_table(SetOpState *setopstate)
 		for (;;)
 		{
 			TupleTableSlot *innerslot;
+			TupleHashTable hashtable = setopstate->hashtable;
 			TupleHashEntryData *entry;
 
 			innerslot = ExecProcNode(innerPlan);
@@ -472,13 +483,17 @@ setop_fill_hash_table(SetOpState *setopstate)
 				break;
 
 			/* For tuples not seen previously, do not make hashtable entry */
-			entry = LookupTupleHashEntry(setopstate->hashtable,
+			entry = LookupTupleHashEntry(hashtable,
 										 innerslot,
 										 NULL, NULL);
 
 			/* Advance the counts if entry is already present */
 			if (entry)
-				((SetOpStatePerGroup) entry->additional)->numRight++;
+			{
+				SetOpStatePerGroup pergroup = TupleHashEntryGetAdditional(hashtable, entry);
+
+				pergroup->numRight++;
+			}
 
 			/* Must reset expression context after each hashtable lookup */
 			ResetExprContext(econtext);
@@ -496,7 +511,7 @@ setop_fill_hash_table(SetOpState *setopstate)
 static TupleTableSlot *
 setop_retrieve_hash_table(SetOpState *setopstate)
 {
-	TupleHashEntryData *entry;
+	TupleHashEntry entry;
 	TupleTableSlot *resultTupleSlot;
 
 	/*
@@ -509,12 +524,15 @@ setop_retrieve_hash_table(SetOpState *setopstate)
 	 */
 	while (!setopstate->setop_done)
 	{
+		TupleHashTable hashtable = setopstate->hashtable;
+		SetOpStatePerGroup pergroup;
+
 		CHECK_FOR_INTERRUPTS();
 
 		/*
 		 * Find the next entry in the hash table
 		 */
-		entry = ScanTupleHashTable(setopstate->hashtable, &setopstate->hashiter);
+		entry = ScanTupleHashTable(hashtable, &setopstate->hashiter);
 		if (entry == NULL)
 		{
 			/* No more entries in hashtable, so done */
@@ -526,12 +544,13 @@ setop_retrieve_hash_table(SetOpState *setopstate)
 		 * See if we should emit any copies of this tuple, and if so return
 		 * the first copy.
 		 */
-		set_output_count(setopstate, (SetOpStatePerGroup) entry->additional);
+		pergroup = TupleHashEntryGetAdditional(hashtable, entry);
+		set_output_count(setopstate, pergroup);
 
 		if (setopstate->numOutput > 0)
 		{
 			setopstate->numOutput--;
-			return ExecStoreMinimalTuple(entry->firstTuple,
+			return ExecStoreMinimalTuple(TupleHashEntryGetTuple(entry),
 										 resultTupleSlot,
 										 false);
 		}
@@ -578,13 +597,15 @@ ExecInitSetOp(SetOp *node, EState *estate, int eflags)
 	/*
 	 * If hashing, we also need a longer-lived context to store the hash
 	 * table.  The table can't just be kept in the per-query context because
-	 * we want to be able to throw it away in ExecReScanSetOp.
+	 * we want to be able to throw it away in ExecReScanSetOp.  We can use a
+	 * BumpContext to save storage, because we will have no need to delete
+	 * individual table entries.
 	 */
 	if (node->strategy == SETOP_HASHED)
-		setopstate->tableContext =
-			AllocSetContextCreate(CurrentMemoryContext,
-								  "SetOp hash table",
-								  ALLOCSET_DEFAULT_SIZES);
+		setopstate->tuplesContext =
+			BumpContextCreate(CurrentMemoryContext,
+							  "SetOp hashed tuples",
+							  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * initialize child nodes
@@ -669,9 +690,9 @@ ExecInitSetOp(SetOp *node, EState *estate, int eflags)
 void
 ExecEndSetOp(SetOpState *node)
 {
-	/* free subsidiary stuff including hashtable */
-	if (node->tableContext)
-		MemoryContextDelete(node->tableContext);
+	/* free subsidiary stuff including hashtable data */
+	if (node->tuplesContext)
+		MemoryContextDelete(node->tuplesContext);
 
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
@@ -710,11 +731,7 @@ ExecReScanSetOp(SetOpState *node)
 			return;
 		}
 
-		/* Release any hashtable storage */
-		if (node->tableContext)
-			MemoryContextReset(node->tableContext);
-
-		/* And rebuild an empty hashtable */
+		/* Else, we must rebuild the hashtable */
 		ResetTupleHashTable(node->hashtable);
 		node->table_filled = false;
 	}

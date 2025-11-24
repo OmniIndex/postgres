@@ -6,7 +6,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/regress.c
@@ -21,12 +21,14 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
+#include "executor/functions.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -36,7 +38,9 @@
 #include "optimizer/plancat.h"
 #include "parser/parse_coerce.h"
 #include "port/atomics.h"
+#include "postmaster/postmaster.h"	/* for MAX_BACKENDS */
 #include "storage/spin.h"
+#include "tcop/tcopprot.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
@@ -78,7 +82,10 @@
 
 static void regress_lseg_construct(LSEG *lseg, Point *pt1, Point *pt2);
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "regress",
+					.version = PG_VERSION
+);
 
 
 /* return the point where two paths intersect, or NULL if no intersection. */
@@ -262,226 +269,6 @@ trigger_return_old(PG_FUNCTION_ARGS)
 	return PointerGetDatum(tuple);
 }
 
-#define TTDUMMY_INFINITY	999999
-
-static SPIPlanPtr splan = NULL;
-static bool ttoff = false;
-
-PG_FUNCTION_INFO_V1(ttdummy);
-
-Datum
-ttdummy(PG_FUNCTION_ARGS)
-{
-	TriggerData *trigdata = (TriggerData *) fcinfo->context;
-	Trigger    *trigger;		/* to get trigger name */
-	char	  **args;			/* arguments */
-	int			attnum[2];		/* fnumbers of start/stop columns */
-	Datum		oldon,
-				oldoff;
-	Datum		newon,
-				newoff;
-	Datum	   *cvals;			/* column values */
-	char	   *cnulls;			/* column nulls */
-	char	   *relname;		/* triggered relation name */
-	Relation	rel;			/* triggered relation */
-	HeapTuple	trigtuple;
-	HeapTuple	newtuple = NULL;
-	HeapTuple	rettuple;
-	TupleDesc	tupdesc;		/* tuple description */
-	int			natts;			/* # of attributes */
-	bool		isnull;			/* to know is some column NULL or not */
-	int			ret;
-	int			i;
-
-	if (!CALLED_AS_TRIGGER(fcinfo))
-		elog(ERROR, "ttdummy: not fired by trigger manager");
-	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
-		elog(ERROR, "ttdummy: must be fired for row");
-	if (!TRIGGER_FIRED_BEFORE(trigdata->tg_event))
-		elog(ERROR, "ttdummy: must be fired before event");
-	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-		elog(ERROR, "ttdummy: cannot process INSERT event");
-	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-		newtuple = trigdata->tg_newtuple;
-
-	trigtuple = trigdata->tg_trigtuple;
-
-	rel = trigdata->tg_relation;
-	relname = SPI_getrelname(rel);
-
-	/* check if TT is OFF for this relation */
-	if (ttoff)					/* OFF - nothing to do */
-	{
-		pfree(relname);
-		return PointerGetDatum((newtuple != NULL) ? newtuple : trigtuple);
-	}
-
-	trigger = trigdata->tg_trigger;
-
-	if (trigger->tgnargs != 2)
-		elog(ERROR, "ttdummy (%s): invalid (!= 2) number of arguments %d",
-			 relname, trigger->tgnargs);
-
-	args = trigger->tgargs;
-	tupdesc = rel->rd_att;
-	natts = tupdesc->natts;
-
-	for (i = 0; i < 2; i++)
-	{
-		attnum[i] = SPI_fnumber(tupdesc, args[i]);
-		if (attnum[i] <= 0)
-			elog(ERROR, "ttdummy (%s): there is no attribute %s",
-				 relname, args[i]);
-		if (SPI_gettypeid(tupdesc, attnum[i]) != INT4OID)
-			elog(ERROR, "ttdummy (%s): attribute %s must be of integer type",
-				 relname, args[i]);
-	}
-
-	oldon = SPI_getbinval(trigtuple, tupdesc, attnum[0], &isnull);
-	if (isnull)
-		elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[0]);
-
-	oldoff = SPI_getbinval(trigtuple, tupdesc, attnum[1], &isnull);
-	if (isnull)
-		elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
-
-	if (newtuple != NULL)		/* UPDATE */
-	{
-		newon = SPI_getbinval(newtuple, tupdesc, attnum[0], &isnull);
-		if (isnull)
-			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[0]);
-		newoff = SPI_getbinval(newtuple, tupdesc, attnum[1], &isnull);
-		if (isnull)
-			elog(ERROR, "ttdummy (%s): %s must be NOT NULL", relname, args[1]);
-
-		if (oldon != newon || oldoff != newoff)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("ttdummy (%s): you cannot change %s and/or %s columns (use set_ttdummy)",
-							relname, args[0], args[1])));
-
-		if (newoff != TTDUMMY_INFINITY)
-		{
-			pfree(relname);		/* allocated in upper executor context */
-			return PointerGetDatum(NULL);
-		}
-	}
-	else if (oldoff != TTDUMMY_INFINITY)	/* DELETE */
-	{
-		pfree(relname);
-		return PointerGetDatum(NULL);
-	}
-
-	newoff = DirectFunctionCall1(nextval, CStringGetTextDatum("ttdummy_seq"));
-	/* nextval now returns int64; coerce down to int32 */
-	newoff = Int32GetDatum((int32) DatumGetInt64(newoff));
-
-	/* Connect to SPI manager */
-	SPI_connect();
-
-	/* Fetch tuple values and nulls */
-	cvals = (Datum *) palloc(natts * sizeof(Datum));
-	cnulls = (char *) palloc(natts * sizeof(char));
-	for (i = 0; i < natts; i++)
-	{
-		cvals[i] = SPI_getbinval((newtuple != NULL) ? newtuple : trigtuple,
-								 tupdesc, i + 1, &isnull);
-		cnulls[i] = (isnull) ? 'n' : ' ';
-	}
-
-	/* change date column(s) */
-	if (newtuple)				/* UPDATE */
-	{
-		cvals[attnum[0] - 1] = newoff;	/* start_date eq current date */
-		cnulls[attnum[0] - 1] = ' ';
-		cvals[attnum[1] - 1] = TTDUMMY_INFINITY;	/* stop_date eq INFINITY */
-		cnulls[attnum[1] - 1] = ' ';
-	}
-	else
-		/* DELETE */
-	{
-		cvals[attnum[1] - 1] = newoff;	/* stop_date eq current date */
-		cnulls[attnum[1] - 1] = ' ';
-	}
-
-	/* if there is no plan ... */
-	if (splan == NULL)
-	{
-		SPIPlanPtr	pplan;
-		Oid		   *ctypes;
-		char	   *query;
-
-		/* allocate space in preparation */
-		ctypes = (Oid *) palloc(natts * sizeof(Oid));
-		query = (char *) palloc(100 + 16 * natts);
-
-		/*
-		 * Construct query: INSERT INTO _relation_ VALUES ($1, ...)
-		 */
-		sprintf(query, "INSERT INTO %s VALUES (", relname);
-		for (i = 1; i <= natts; i++)
-		{
-			sprintf(query + strlen(query), "$%d%s",
-					i, (i < natts) ? ", " : ")");
-			ctypes[i - 1] = SPI_gettypeid(tupdesc, i);
-		}
-
-		/* Prepare plan for query */
-		pplan = SPI_prepare(query, natts, ctypes);
-		if (pplan == NULL)
-			elog(ERROR, "ttdummy (%s): SPI_prepare returned %s", relname, SPI_result_code_string(SPI_result));
-
-		if (SPI_keepplan(pplan))
-			elog(ERROR, "ttdummy (%s): SPI_keepplan failed", relname);
-
-		splan = pplan;
-	}
-
-	ret = SPI_execp(splan, cvals, cnulls, 0);
-
-	if (ret < 0)
-		elog(ERROR, "ttdummy (%s): SPI_execp returned %d", relname, ret);
-
-	/* Tuple to return to upper Executor ... */
-	if (newtuple)				/* UPDATE */
-		rettuple = SPI_modifytuple(rel, trigtuple, 1, &(attnum[1]), &newoff, NULL);
-	else						/* DELETE */
-		rettuple = trigtuple;
-
-	SPI_finish();				/* don't forget say Bye to SPI mgr */
-
-	pfree(relname);
-
-	return PointerGetDatum(rettuple);
-}
-
-PG_FUNCTION_INFO_V1(set_ttdummy);
-
-Datum
-set_ttdummy(PG_FUNCTION_ARGS)
-{
-	int32		on = PG_GETARG_INT32(0);
-
-	if (ttoff)					/* OFF currently */
-	{
-		if (on == 0)
-			PG_RETURN_INT32(0);
-
-		/* turn ON */
-		ttoff = false;
-		PG_RETURN_INT32(0);
-	}
-
-	/* ON currently */
-	if (on != 0)
-		PG_RETURN_INT32(1);
-
-	/* turn OFF */
-	ttoff = true;
-
-	PG_RETURN_INT32(1);
-}
-
 
 /*
  * Type int44 has no real-world use, but the regression tests use it
@@ -647,7 +434,7 @@ PG_FUNCTION_INFO_V1(get_environ);
 Datum
 get_environ(PG_FUNCTION_ARGS)
 {
-#if !defined(WIN32) || defined(_MSC_VER)
+#if !defined(WIN32)
 	extern char **environ;
 #endif
 	int			nvals = 0;
@@ -938,6 +725,13 @@ test_fdw_handler(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
+PG_FUNCTION_INFO_V1(is_catalog_text_unique_index_oid);
+Datum
+is_catalog_text_unique_index_oid(PG_FUNCTION_ARGS)
+{
+	return BoolGetDatum(IsCatalogTextUniqueIndexOid(PG_GETARG_OID(0)));
+}
+
 PG_FUNCTION_INFO_V1(test_support_func);
 Datum
 test_support_func(PG_FUNCTION_ARGS)
@@ -1011,11 +805,180 @@ test_support_func(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(ret);
 }
 
+PG_FUNCTION_INFO_V1(test_inline_in_from_support_func);
+Datum
+test_inline_in_from_support_func(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestInlineInFrom))
+	{
+		/*
+		 * Assume that the target is foo_from_bar; that's safe as long as we
+		 * don't attach this to any other function.
+		 */
+		SupportRequestInlineInFrom *req = (SupportRequestInlineInFrom *) rawreq;
+		StringInfoData sql;
+		RangeTblFunction *rtfunc = req->rtfunc;
+		FuncExpr   *expr = (FuncExpr *) rtfunc->funcexpr;
+		Node	   *node;
+		Const	   *c;
+		char	   *colname;
+		char	   *tablename;
+		SQLFunctionParseInfoPtr pinfo;
+		List	   *raw_parsetree_list;
+		List	   *querytree_list;
+		Query	   *querytree;
+
+		if (list_length(expr->args) != 3)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with %d args but expected 3", list_length(expr->args))));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		/* Get colname */
+		node = linitial(expr->args);
+		if (!IsA(node, Const))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-Const parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		c = (Const *) node;
+		if (c->consttype != TEXTOID || c->constisnull)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-TEXT parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+		colname = TextDatumGetCString(c->constvalue);
+
+		/* Get tablename */
+		node = lsecond(expr->args);
+		if (!IsA(node, Const))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-Const parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		c = (Const *) node;
+		if (c->consttype != TEXTOID || c->constisnull)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func called with non-TEXT parameters")));
+			PG_RETURN_POINTER(NULL);
+		}
+		tablename = TextDatumGetCString(c->constvalue);
+
+		/* Begin constructing replacement SELECT query. */
+		initStringInfo(&sql);
+		appendStringInfo(&sql, "SELECT %s::text FROM %s",
+						 quote_identifier(colname),
+						 quote_identifier(tablename));
+
+		/* Add filter expression if present. */
+		node = lthird(expr->args);
+		if (!(IsA(node, Const) && ((Const *) node)->constisnull))
+		{
+			/*
+			 * We only filter if $3 is not constant-NULL.  This is not a very
+			 * exact implementation of the PL/pgSQL original, but it's close
+			 * enough for demonstration purposes.
+			 */
+			appendStringInfo(&sql, " WHERE %s::text = $3",
+							 quote_identifier(colname));
+		}
+
+		/* Build a SQLFunctionParseInfo with the parameters of my function. */
+		pinfo = prepare_sql_fn_parse_info(req->proc,
+										  (Node *) expr,
+										  expr->inputcollid);
+
+		/* Parse the generated SQL. */
+		raw_parsetree_list = pg_parse_query(sql.data);
+		if (list_length(raw_parsetree_list) != 1)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func parsed to more than one node")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		/* Analyze the parse tree as if it were a SQL-language body. */
+		querytree_list = pg_analyze_and_rewrite_withcb(linitial(raw_parsetree_list),
+													   sql.data,
+													   (ParserSetupHook) sql_fn_parser_setup,
+													   pinfo, NULL);
+		if (list_length(querytree_list) != 1)
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func rewrote to more than one node")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		querytree = linitial(querytree_list);
+		if (!IsA(querytree, Query))
+		{
+			ereport(WARNING, (errmsg("test_inline_in_from_support_func didn't parse to a Query")));
+			PG_RETURN_POINTER(NULL);
+		}
+
+		PG_RETURN_POINTER(querytree);
+	}
+
+	PG_RETURN_POINTER(NULL);
+}
+
 PG_FUNCTION_INFO_V1(test_opclass_options_func);
 Datum
 test_opclass_options_func(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_NULL();
+}
+
+/* one-time tests for encoding infrastructure */
+PG_FUNCTION_INFO_V1(test_enc_setup);
+Datum
+test_enc_setup(PG_FUNCTION_ARGS)
+{
+	/* Test pg_encoding_set_invalid() */
+	for (int i = 0; i < _PG_LAST_ENCODING_; i++)
+	{
+		char		buf[2],
+					bigbuf[16];
+		int			len,
+					mblen,
+					valid;
+
+		if (pg_encoding_max_length(i) == 1)
+			continue;
+		pg_encoding_set_invalid(i, buf);
+		len = strnlen(buf, 2);
+		if (len != 2)
+			elog(WARNING,
+				 "official invalid string for encoding \"%s\" has length %d",
+				 pg_enc2name_tbl[i].name, len);
+		mblen = pg_encoding_mblen(i, buf);
+		if (mblen != 2)
+			elog(WARNING,
+				 "official invalid string for encoding \"%s\" has mblen %d",
+				 pg_enc2name_tbl[i].name, mblen);
+		valid = pg_encoding_verifymbstr(i, buf, len);
+		if (valid != 0)
+			elog(WARNING,
+				 "official invalid string for encoding \"%s\" has valid prefix of length %d",
+				 pg_enc2name_tbl[i].name, valid);
+		valid = pg_encoding_verifymbstr(i, buf, 1);
+		if (valid != 0)
+			elog(WARNING,
+				 "first byte of official invalid string for encoding \"%s\" has valid prefix of length %d",
+				 pg_enc2name_tbl[i].name, valid);
+		memset(bigbuf, ' ', sizeof(bigbuf));
+		bigbuf[0] = buf[0];
+		bigbuf[1] = buf[1];
+		valid = pg_encoding_verifymbstr(i, bigbuf, sizeof(bigbuf));
+		if (valid != 0)
+			elog(WARNING,
+				 "trailing data changed official invalid string for encoding \"%s\" to have valid prefix of length %d",
+				 pg_enc2name_tbl[i].name, valid);
+	}
+
+	PG_RETURN_VOID();
 }
 
 /*
@@ -1157,4 +1120,32 @@ binary_coercible(PG_FUNCTION_ARGS)
 	Oid			targettype = PG_GETARG_OID(1);
 
 	PG_RETURN_BOOL(IsBinaryCoercible(srctype, targettype));
+}
+
+/*
+ * Sanity checks for functions in relpath.h
+ */
+PG_FUNCTION_INFO_V1(test_relpath);
+Datum
+test_relpath(PG_FUNCTION_ARGS)
+{
+	RelPathStr	rpath;
+
+	/*
+	 * Verify that PROCNUMBER_CHARS and MAX_BACKENDS stay in sync.
+	 * Unfortunately I don't know how to express that in a way suitable for a
+	 * static assert.
+	 */
+	if ((int) ceil(log10(MAX_BACKENDS)) != PROCNUMBER_CHARS)
+		elog(WARNING, "mismatch between MAX_BACKENDS and PROCNUMBER_CHARS");
+
+	/* verify that the max-length relpath is generated ok */
+	rpath = GetRelationPath(OID_MAX, OID_MAX, OID_MAX, MAX_BACKENDS - 1,
+							INIT_FORKNUM);
+
+	if (strlen(rpath.str) != REL_PATH_STR_MAXLEN)
+		elog(WARNING, "maximum length relpath is if length %zu instead of %zu",
+			 strlen(rpath.str), REL_PATH_STR_MAXLEN);
+
+	PG_RETURN_VOID();
 }

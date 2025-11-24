@@ -11,7 +11,7 @@
  * Also optionally, we can apply a tuple conversion map before storing.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -25,6 +25,7 @@
 #include "access/detoast.h"
 #include "access/tupconvert.h"
 #include "executor/tstoreReceiver.h"
+#include "varatt.h"
 
 
 typedef struct

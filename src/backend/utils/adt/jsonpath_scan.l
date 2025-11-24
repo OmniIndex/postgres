@@ -7,7 +7,7 @@
  * Splits jsonpath string into tokens represented as JsonPathString structs.
  * Decodes unicode and hex escaped strings.
  *
- * Copyright (c) 2019-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2025, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_scan.l
@@ -34,7 +34,6 @@ struct jsonpath_yy_extra_type
 {
 	JsonPathString scanstring;
 };
-#define YY_EXTRA_TYPE struct jsonpath_yy_extra_type *
 
 static void addstring(bool init, char *s, int l, yyscan_t yyscanner);
 static void addchar(bool init, char c, yyscan_t yyscanner);
@@ -64,6 +63,7 @@ fprintf_to_ereport(const char *fmt, const char *msg)
 %option noyywrap
 %option warn
 %option prefix="jsonpath_yy"
+%option extra-type="struct jsonpath_yy_extra_type *"
 %option reentrant
 %option bison-bridge
 %option noyyalloc
@@ -574,7 +574,7 @@ hexval(char c, int *result, struct Node *escontext, yyscan_t yyscanner)
 
 /* Add given unicode character to scanstring */
 static bool
-addUnicodeChar(int ch, struct Node *escontext, yyscan_t yyscanner)
+addUnicodeChar(char32_t ch, struct Node *escontext, yyscan_t yyscanner)
 {
 	if (ch == 0)
 	{
@@ -607,7 +607,7 @@ addUnicodeChar(int ch, struct Node *escontext, yyscan_t yyscanner)
 
 /* Add unicode character, processing any surrogate pairs */
 static bool
-addUnicode(int ch, int *hi_surrogate, struct Node *escontext, yyscan_t yyscanner)
+addUnicode(char32_t ch, int *hi_surrogate, struct Node *escontext, yyscan_t yyscanner)
 {
 	if (is_utf16_surrogate_first(ch))
 	{
@@ -655,7 +655,7 @@ parseUnicode(char *s, int l, struct Node *escontext, yyscan_t yyscanner)
 
 	for (i = 2; i < l; i += 2)	/* skip '\u' */
 	{
-		int			ch = 0;
+		char32_t		ch = 0;
 		int			j,
 					si;
 

@@ -4,7 +4,7 @@
  * exprparse.y
  *	  bison grammar for a simple expression syntax
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pgbench/exprparse.y
@@ -20,8 +20,6 @@
 #define PGBENCH_NARGS_CASE		(-2)
 #define PGBENCH_NARGS_HASH		(-3)
 #define PGBENCH_NARGS_PERMUTE	(-4)
-
-PgBenchExpr *expr_parse_result;
 
 static PgBenchExprList *make_elist(PgBenchExpr *expr, PgBenchExprList *list);
 static PgBenchExpr *make_null_constant(void);
@@ -42,6 +40,7 @@ static PgBenchExpr *make_case(yyscan_t yyscanner, PgBenchExprList *when_then_lis
 %expect 0
 %name-prefix="expr_yy"
 
+%parse-param {PgBenchExpr **expr_parse_result_p}
 %parse-param {yyscan_t yyscanner}
 %lex-param   {yyscan_t yyscanner}
 
@@ -81,7 +80,7 @@ static PgBenchExpr *make_case(yyscan_t yyscanner, PgBenchExprList *when_then_lis
 %%
 
 result: expr				{
-								expr_parse_result = $1;
+								*expr_parse_result_p = $1;
 								(void) yynerrs; /* suppress compiler warning */
 							}
 

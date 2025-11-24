@@ -3,7 +3,7 @@
  *
  * repl_gram.y				- Parser for the replication commands
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2025, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,10 +25,6 @@
 #include "repl_gram.h"
 
 
-/* Result of the parsing is returned here */
-Node *replication_parse_result;
-
-
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
  * so we can easily have it use palloc instead of malloc.  This prevents
@@ -39,6 +35,7 @@ Node *replication_parse_result;
 
 %}
 
+%parse-param {Node **replication_parse_result_p}
 %parse-param {yyscan_t yyscanner}
 %lex-param   {yyscan_t yyscanner}
 %pure-parser
@@ -104,7 +101,7 @@ Node *replication_parse_result;
 
 firstcmd: command opt_semicolon
 				{
-					replication_parse_result = $1;
+					*replication_parse_result_p = $1;
 
 					(void) yynerrs; /* suppress compiler warning */
 				}
@@ -282,7 +279,7 @@ alter_replication_slot:
 			;
 
 /*
- * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%X [TIMELINE %u]
+ * START_REPLICATION [SLOT slot] [PHYSICAL] %X/%08X [TIMELINE %u]
  */
 start_replication:
 			K_START_REPLICATION opt_slot opt_physical RECPTR opt_timeline
@@ -298,7 +295,7 @@ start_replication:
 				}
 			;
 
-/* START_REPLICATION SLOT slot LOGICAL %X/%X options */
+/* START_REPLICATION SLOT slot LOGICAL %X/%08X options */
 start_logical_replication:
 			K_START_REPLICATION K_SLOT IDENT K_LOGICAL RECPTR plugin_options
 				{

@@ -4,7 +4,7 @@
  *	  Heap-specific definitions for external and compressed storage
  *	  of variable size attributes.
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2025, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -561,8 +561,8 @@ toast_flatten_tuple_to_datum(HeapTupleHeader tup,
  */
 HeapTuple
 toast_build_flattened_tuple(TupleDesc tupleDesc,
-							Datum *values,
-							bool *isnull)
+							const Datum *values,
+							const bool *isnull)
 {
 	HeapTuple	new_tuple;
 	int			numAttrs = tupleDesc->natts;
